@@ -423,7 +423,9 @@ export function mapHistoryMessagesToUiMessages(messages: MessageEntry[]): UIMess
       continue
     }
 
-    if (msg.type === 'assistant' && Array.isArray(msg.content)) {
+    // Server marks assistant messages containing tool_use blocks as type 'tool_use',
+    // but the content array structure is the same as 'assistant' — handle both.
+    if ((msg.type === 'assistant' || msg.type === 'tool_use') && Array.isArray(msg.content)) {
       for (const block of msg.content as AssistantHistoryBlock[]) {
         if (block.type === 'thinking' && block.thinking) {
           uiMessages.push({
@@ -454,7 +456,9 @@ export function mapHistoryMessagesToUiMessages(messages: MessageEntry[]): UIMess
       continue
     }
 
-    if (msg.type === 'user' && Array.isArray(msg.content)) {
+    // Server marks user messages containing tool_result blocks as type 'tool_result',
+    // but the content array structure is the same as 'user' — handle both.
+    if ((msg.type === 'user' || msg.type === 'tool_result') && Array.isArray(msg.content)) {
       const textParts: string[] = []
       const attachments: UIAttachment[] = []
 
