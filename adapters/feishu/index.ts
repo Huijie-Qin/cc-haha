@@ -9,7 +9,8 @@
 
 import * as Lark from '@larksuiteoapi/node-sdk'
 import * as path from 'node:path'
-import { WsBridge, type ServerMessage } from '../common/ws-bridge.js'
+import * as fs from 'node:fs/promises'
+import { WsBridge, type ServerMessage, type AttachmentRef } from '../common/ws-bridge.js'
 import { MessageDedup } from '../common/message-dedup.js'
 import { StreamingCard } from './streaming-card.js'
 import { enqueue } from '../common/chat-queue.js'
@@ -24,6 +25,11 @@ import { AdapterHttpClient, type RecentProject } from '../common/http-client.js'
 import { isAllowedUser, tryPair } from '../common/pairing.js'
 import { optimizeMarkdownForFeishu } from './markdown-style.js'
 import { extractInboundPayload } from './extract-payload.js'
+import { FeishuMediaService } from './media.js'
+import { AttachmentStore } from '../common/attachment/attachment-store.js'
+import { checkAttachmentLimit } from '../common/attachment/attachment-limits.js'
+import { ImageBlockWatcher } from '../common/attachment/image-block-watcher.js'
+import type { PendingUpload } from '../common/attachment/attachment-types.js'
 
 // ---------- init ----------
 
@@ -45,10 +51,24 @@ const dedup = new MessageDedup()
 const sessionStore = new SessionStore()
 const httpClient = new AdapterHttpClient(config.serverUrl)
 
+// Attachment plumbing — shared by inbound (download) and outbound (upload) paths.
+const attachmentStore = new AttachmentStore()
+const media = new FeishuMediaService(larkClient, attachmentStore)
+attachmentStore.gc().catch((err) => {
+  console.warn('[Feishu] AttachmentStore.gc failed:', err instanceof Error ? err.message : err)
+})
+
 // One streaming card lifecycle per chatId (CardKit main + patch fallback).
 const streamingCards = new Map<string, StreamingCard>()
 const pendingProjectSelection = new Map<string, boolean>()
 const runtimeStates = new Map<string, ChatRuntimeState>()
+
+// Per-chat outbound watchers for Agent-produced markdown image references.
+// `imageWatchers` extracts `![alt](src)` from streaming text;
+// `uploadedImageKeys` caches fingerprint → image_key so the same image
+// referenced multiple times in one turn isn't re-uploaded.
+const imageWatchers = new Map<string, ImageBlockWatcher>()
+const uploadedImageKeys = new Map<string, Map<string, string>>()
 
 // Bot's own open_id (resolved on first message)
 let botOpenId: string | null = null
@@ -83,6 +103,72 @@ function getOrCreateStreamingCard(chatId: string): StreamingCard {
   return card
 }
 
+function getImageWatcher(chatId: string): ImageBlockWatcher {
+  let w = imageWatchers.get(chatId)
+  if (!w) {
+    w = new ImageBlockWatcher()
+    imageWatchers.set(chatId, w)
+  }
+  return w
+}
+
+function getUploadedKeys(chatId: string): Map<string, string> {
+  let m = uploadedImageKeys.get(chatId)
+  if (!m) {
+    m = new Map()
+    uploadedImageKeys.set(chatId, m)
+  }
+  return m
+}
+
+/** Upload a PendingUpload found in streaming output and send it as an
+ *  independent im.message.create({msg_type:'image'}) message — runs
+ *  fire-and-forget so the streaming card is never blocked. All failure
+ *  modes are non-fatal: log and skip. */
+async function dispatchOutboundImage(chatId: string, pending: PendingUpload): Promise<void> {
+  const cache = getUploadedKeys(chatId)
+  if (cache.has(pending.id)) return // already uploaded within this chat
+
+  try {
+    let buffer: Buffer
+    let mime = 'image/png'
+    switch (pending.source.kind) {
+      case 'base64': {
+        buffer = Buffer.from(pending.source.data, 'base64')
+        mime = pending.source.mime
+        break
+      }
+      case 'path': {
+        buffer = await fs.readFile(pending.source.path)
+        mime = pending.source.mime ?? 'image/png'
+        break
+      }
+      case 'url': {
+        const resp = await fetch(pending.source.url)
+        if (!resp.ok) throw new Error(`fetch ${pending.source.url} -> ${resp.status}`)
+        buffer = Buffer.from(await resp.arrayBuffer())
+        mime = pending.source.mime ?? resp.headers.get('content-type') ?? 'image/png'
+        break
+      }
+    }
+
+    const check = checkAttachmentLimit('image', buffer.length, mime)
+    if (!check.ok) {
+      console.warn('[Feishu] Outbound image rejected:', check.hint)
+      return
+    }
+
+    const imageKey = await media.uploadImage(buffer, mime)
+    cache.set(pending.id, imageKey)
+    await media.sendImageMessage(chatId, imageKey)
+  } catch (err) {
+    console.error(
+      '[Feishu] dispatchOutboundImage failed:',
+      err instanceof Error ? err.message : err,
+    )
+  }
+}
+
 /** Finalize and remove the streaming card (normal completion). */
 async function finalizeStreamingCard(chatId: string): Promise<void> {
   const card = streamingCards.get(chatId)
@@ -106,6 +192,8 @@ function clearTransientChatState(chatId: string): void {
     streamingCards.delete(chatId)
     void card.abort(new Error('session cleared')).catch(() => {})
   }
+  imageWatchers.delete(chatId)
+  uploadedImageKeys.delete(chatId)
   const runtime = getRuntimeState(chatId)
   runtime.state = 'idle'
   runtime.verb = undefined
@@ -630,6 +718,8 @@ async function startNewSession(chatId: string, query?: string): Promise<void> {
     streamingCards.delete(chatId)
     void inflightCard.abort(new Error('session reset')).catch(() => {})
   }
+  imageWatchers.delete(chatId)
+  uploadedImageKeys.delete(chatId)
   pendingProjectSelection.delete(chatId)
   runtimeStates.delete(chatId)
 
@@ -709,6 +799,16 @@ async function handleServerMessage(chatId: string, msg: ServerMessage): Promise<
           console.error('[Feishu] ensureCreated on delta failed:', err)
         })
         card.appendText(msg.text)
+
+        // Watch the streaming text for outbound markdown image references
+        // (`![alt](src)`) and dispatch each new one as a standalone
+        // im.message.create({msg_type:'image'}) — fire-and-forget so the
+        // streaming card never waits on upload RTT. The image arrives in
+        // chat as a separate message alongside the streaming card text.
+        const newUploads = getImageWatcher(chatId).feed(msg.text)
+        for (const pending of newUploads) {
+          void dispatchOutboundImage(chatId, pending)
+        }
       }
       break
     }
@@ -824,35 +924,43 @@ async function handleMessage(data: any): Promise<void> {
     return
   }
 
-  let text = extractText(content, msgType)
-  if (!text) return
+  const payload = extractInboundPayload(content, msgType)
+  const msgText = stripMentions(payload.text || '')
+  const pendingDownloads = payload.pendingDownloads
+  const hasAttachments = pendingDownloads.length > 0
 
-  text = stripMentions(text)
-  if (!text) return
+  // Allow empty text only when attachments are present
+  // (image-only / file-only message)
+  if (!msgText && !hasAttachments) return
 
-  const msgText = text  // capture in a const so TypeScript knows it's not null inside closures
+  // Capture messageId in a non-nullable const before entering the enqueue
+  // closure so the downloadResource call below doesn't need a `!` assertion.
+  // The early-return guard at the top of handleMessage already proved it
+  // non-undefined, but TS doesn't track that across the async closure.
+  const safeMessageId = messageId
 
   // All user input (commands + normal chat) goes through a single per-chat
   // serial queue. Without this, rapidly-fired commands could have their
   // async bodies interleave at `await` points, causing reply messages
   // (e.g. "🧹 已清空..." after "✅ 已新建...") to appear in the wrong order.
   enqueue(chatId, async () => {
-    // ----- Commands -----
+    // ----- Commands (only when there are no attachments — `command + image`
+    //       isn't a meaningful combo, so attachments always take precedence) -----
 
-    if (msgText === '/new' || msgText === '新会话' || msgText.startsWith('/new ')) {
+    if (!hasAttachments && (msgText === '/new' || msgText === '新会话' || msgText.startsWith('/new '))) {
       const arg = msgText.startsWith('/new ') ? msgText.slice(5).trim() : ''
       await startNewSession(chatId, arg || undefined)
       return
     }
-    if (msgText === '/help' || msgText === '帮助') {
+    if (!hasAttachments && (msgText === '/help' || msgText === '帮助')) {
       await sendText(chatId, formatImHelp())
       return
     }
-    if (msgText === '/status' || msgText === '状态') {
+    if (!hasAttachments && (msgText === '/status' || msgText === '状态')) {
       await sendText(chatId, await buildStatusText(chatId))
       return
     }
-    if (msgText === '/clear' || msgText === '清空') {
+    if (!hasAttachments && (msgText === '/clear' || msgText === '清空')) {
       const stored = await ensureExistingSession(chatId)
       if (!stored) {
         await sendText(chatId, formatImStatus(null))
@@ -867,7 +975,7 @@ async function handleMessage(data: any): Promise<void> {
       await sendText(chatId, '🧹 已清空当前会话上下文。')
       return
     }
-    if (msgText === '/stop' || msgText === '停止') {
+    if (!hasAttachments && (msgText === '/stop' || msgText === '停止')) {
       const stored = await ensureExistingSession(chatId)
       if (!stored) {
         await sendText(chatId, formatImStatus(null))
@@ -877,35 +985,107 @@ async function handleMessage(data: any): Promise<void> {
       await sendText(chatId, '⏹ 已发送停止信号。')
       return
     }
-    if (msgText === '/projects' || msgText === '项目列表') {
+    if (!hasAttachments && (msgText === '/projects' || msgText === '项目列表')) {
       await showProjectPicker(chatId)
       return
     }
 
     // User is replying to a project picker prompt
-    if (pendingProjectSelection.has(chatId)) {
+    if (!hasAttachments && pendingProjectSelection.has(chatId)) {
       await startNewSession(chatId, msgText.trim())
       return
     }
 
-    // ----- Normal message flow -----
+    // ----- Normal message flow (with optional inbound attachments) -----
 
     const ready = await ensureSession(chatId)
-    if (ready) {
-      // Pre-create the streaming card immediately so the user sees a
-      // "☁️ 正在思考中..." indicator while the backend is still thinking
-      // (before the first content_delta arrives). We intentionally do NOT
-      // create a card for /clear-style commands (which go through the
-      // earlier branches), so they won't leave an empty card behind.
-      const card = getOrCreateStreamingCard(chatId)
-      void card.ensureCreated().catch((err) => {
-        console.error('[Feishu] pre-create streaming card failed:', err)
-      })
+    if (!ready) return
 
-      const sent = bridge.sendUserMessage(chatId, msgText)
-      if (!sent) {
-        await sendText(chatId, '⚠️ 消息发送失败，连接可能已断开。请发送 /new 重新开始。')
+    // Download attachments (if any). Each download is independent —
+    // a single failure must not poison the rest, so we use allSettled.
+    let attachments: AttachmentRef[] | undefined
+    if (hasAttachments) {
+      try {
+        const stored = sessionStore.get(chatId)
+        const sessionId = stored?.sessionId ?? chatId
+        const settled = await Promise.allSettled(
+          pendingDownloads.map((p) =>
+            media.downloadResource({
+              messageId: safeMessageId,
+              fileKey: p.fileKey,
+              kind: p.kind,
+              fileName: p.fileName,
+              sessionId,
+            }),
+          ),
+        )
+        const accepted: AttachmentRef[] = []
+        let downloadFailures = 0
+        for (const result of settled) {
+          if (result.status === 'rejected') {
+            downloadFailures += 1
+            console.error('[Feishu] downloadResource failed:', result.reason)
+            continue
+          }
+          const local = result.value
+          const check = checkAttachmentLimit(local.kind, local.size, local.mimeType)
+          if (!check.ok) {
+            await sendText(chatId, check.hint)
+            continue
+          }
+          if (local.kind === 'image') {
+            accepted.push({
+              type: 'image',
+              name: local.name,
+              data: local.buffer.toString('base64'),
+              mimeType: local.mimeType,
+            })
+          } else {
+            accepted.push({
+              type: 'file',
+              name: local.name,
+              path: local.path,
+              mimeType: local.mimeType,
+            })
+          }
+        }
+        if (downloadFailures > 0) {
+          await sendText(
+            chatId,
+            downloadFailures === pendingDownloads.length
+              ? '📎 附件下载失败,请稍后重试'
+              : `📎 ${downloadFailures} 个附件下载失败,已跳过`,
+          )
+        }
+        if (accepted.length > 0) attachments = accepted
+      } catch (err) {
+        console.error('[Feishu] Unexpected attachment pipeline error:', err)
+        await sendText(chatId, '📎 附件处理异常,请稍后重试')
+        return
       }
+    }
+
+    const effectiveText =
+      msgText || (attachments && attachments.length > 0 ? '(用户发送了附件)' : '')
+
+    // If all attachments were rejected (limit / download fail) AND user had
+    // no text, silently abort — the rejection hints have already been sent
+    // via sendText, and Claude shouldn't be invoked with empty content.
+    if (!effectiveText && !(attachments && attachments.length > 0)) return
+
+    // Pre-create the streaming card immediately so the user sees a
+    // "☁️ 正在思考中..." indicator while the backend is still thinking
+    // (before the first content_delta arrives). We intentionally do NOT
+    // create a card for /clear-style commands (which go through the
+    // earlier branches), so they won't leave an empty card behind.
+    const card = getOrCreateStreamingCard(chatId)
+    void card.ensureCreated().catch((err) => {
+      console.error('[Feishu] pre-create streaming card failed:', err)
+    })
+
+    const sent = bridge.sendUserMessage(chatId, effectiveText, attachments)
+    if (!sent) {
+      await sendText(chatId, '⚠️ 消息发送失败，连接可能已断开。请发送 /new 重新开始。')
     }
   })
 }
