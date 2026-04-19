@@ -24,6 +24,10 @@
 
 下载安装、macOS/Windows 常见问题、Web UI 模式。
 
+### [WebSocket 通信架构](./05-websocket-architecture.md)
+
+Desktop UI、Server 与 CLI 子进程之间的双通道 WebSocket 通信详解：连接建立、消息格式、流式渲染、权限交互、断线重连、端到端时序图。
+
 ---
 
 ## 快速开始
@@ -37,6 +41,7 @@
 ### 开发者
 
 1. 阅读 [架构设计](./02-architecture.md) 理解三层架构
+2. 阅读 [WebSocket 通信架构](./05-websocket-architecture.md) 理解双通道通信
 2. 关键源码位置：
    - `desktop/src/` — React 前端
    - `desktop/src-tauri/` — Tauri Rust 后端
