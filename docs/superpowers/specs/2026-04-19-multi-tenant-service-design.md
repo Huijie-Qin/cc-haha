@@ -742,3 +742,961 @@ Prometheus metrics endpoint (`:9090/metrics`) on both services for request rates
 - Prometheus metrics and alerting
 - Admin dashboard for tenant management
 - Self-service tenant signup and billing integration (Stripe)
+
+## E2E Verification Flow — Local Docker Environment
+
+This section defines a complete end-to-end verification procedure that runs on a single Mac with Docker Desktop. It validates every data path in the multi-tenant architecture: auth → tenant isolation → session creation → agent execution → permission flow → conversation persistence.
+
+### Prerequisites
+
+| Dependency | Version | Verification Command |
+|------------|---------|---------------------|
+| Docker Engine | 24.0+ | `docker --version` |
+| Docker Compose | v2+ | `docker compose version` |
+| Bun | 1.1+ | `bun --version` |
+| curl | any | `curl --version` |
+| jwt-cli (optional) | 6+ | `jwt --version` |
+
+Docker must have at least 4 GB memory allocated (Docker Desktop → Settings → Resources).
+
+### Quick Start
+
+```bash
+# 1. Build all images and start services
+docker compose -f docker-compose.e2e.yml up --build -d
+
+# 2. Wait for services to be healthy (max 60s)
+./scripts/e2e-wait-for-ready.sh
+
+# 3. Run the full E2E test suite
+./scripts/e2e-test.sh
+
+# 4. Open web UI in browser
+open http://127.0.0.1:3456
+```
+
+### Service Topology (docker-compose.e2e.yml)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Docker Network: cc-haha-e2e                                    │
+│                                                                 │
+│  ┌────────┐   ┌────────────┐   ┌─────────────┐   ┌──────────┐ │
+│  │ pg     │   │ gateway    │   │ orchestrator│   │ web      │ │
+│  │ :5432  │◄──│ :3456      │──►│ :3457       │   │ :2024    │ │
+│  │        │   │            │   │             │   │          │ │
+│  │        │   │ /api/*     │   │ /internal/* │   │ SPA      │ │
+│  │        │   │ /ws/*      │   │             │   │          │ │
+│  │        │   │ /sdk/*     │   │ Docker.sock │   │          │ │
+│  └────────┘   └────────────┘   └──────┬──────┘   └──────────┘ │
+│                                      │                         │
+│                        ┌─────────────▼─────────────┐           │
+│                        │ Agent Container (dynamic) │           │
+│                        │ Created per session       │           │
+│                        │ cc-haha-agent:latest      │           │
+│                        └──────────────────────────┘           │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Docker Compose File
+
+`docker-compose.e2e.yml` at project root:
+
+```yaml
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: cc_haha
+      POSTGRES_USER: cc_haha
+      POSTGRES_PASSWORD: e2e_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cc_haha"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    ports:
+      - "3456:3456"
+    environment:
+      CC_MODE: saas
+      DATABASE_URL: postgres://cc_haha:e2e_password@postgres:5432/cc_haha
+      JWT_PRIVATE_KEY_PATH: /keys/private.pem
+      JWT_PUBLIC_KEY_PATH: /keys/public.pem
+      ENCRYPTION_KEY_PATH: /keys/encryption.key
+      ORCHESTRATOR_URL: http://orchestrator:3457
+    volumes:
+      - ./keys:/keys:ro
+      - web-spa:/app/dist
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile.orchestrator
+    ports:
+      - "3457:3457"
+    environment:
+      DATABASE_URL: postgres://cc_haha:e2e_password@postgres:5432/cc_haha
+      DOCKER_HOST: unix:///var/run/docker.sock
+      GATEWAY_SDK_URL: ws://gateway:3456
+      AGENT_IMAGE: cc-haha-agent:latest
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - agent-workspaces:/workspaces
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  web:
+    build:
+      context: ./desktop
+      dockerfile: Dockerfile.web
+    ports:
+      - "2024:80"
+    depends_on:
+      - gateway
+
+volumes:
+  pgdata:
+  agent-workspaces:
+  web-spa:
+```
+
+### Agent Docker Image
+
+`Dockerfile.agent` at project root:
+
+```dockerfile
+FROM oven/bun:1.1-alpine
+
+WORKDIR /app
+
+# Copy entire project and install dependencies
+COPY package.json bun.lockb ./
+RUN bun install --frozen-lockfile --production
+
+COPY src/ src/
+COPY bin/ bin/
+
+# Agent runs as non-root user
+RUN adduser -D -u 1000 agent
+USER agent
+
+# Default: run CLI in print mode with SDK URL
+# The actual --sdk-url is provided at container create time
+ENTRYPOINT ["bun", "src/entrypoints/cli.tsx"]
+CMD ["--print", "--verbose", "--output-format=stream-json", "--input-format=stream-json"]
+```
+
+### Gateway Docker Image
+
+`Dockerfile.gateway` at project root:
+
+```dockerfile
+FROM oven/bun:1.1-alpine
+
+WORKDIR /app
+
+COPY package.json bun.lockb ./
+RUN bun install --frozen-lockfile --production
+
+COPY src/ src/
+COPY bin/ bin/
+COPY scripts/ scripts/
+
+# Generate self-signed JWT keys for development
+RUN mkdir -p /keys && \
+    openssl genpkey -algorithm RSA -out /keys/private.pem -pkeyopt rsa_keygen_bits:2048 && \
+    openssl rsa -pubout -in /keys/private.pem -out /keys/public.pem && \
+    openssl rand -hex 32 > /keys/encryption.key
+
+EXPOSE 3456
+CMD ["bun", "src/gateway/index.ts"]
+```
+
+### Orchestrator Docker Image
+
+`Dockerfile.orchestrator` at project root:
+
+```dockerfile
+FROM oven/bun:1.1-alpine
+
+# Install Docker CLI for container management
+RUN apk add --no-cache docker-cli
+
+WORKDIR /app
+
+COPY package.json bun.lockb ./
+RUN bun install --frozen-lockfile --production
+
+COPY src/ src/
+
+# Pre-build the agent image (available to Docker daemon via socket mount)
+COPY Dockerfile.agent /app/Dockerfile.agent
+
+EXPOSE 3457
+CMD ["bun", "src/orchestrator/index.ts"]
+```
+
+### Web SPA Docker Image
+
+`Dockerfile.web` in `desktop/`:
+
+```dockerfile
+FROM oven/bun:1.1-alpine AS build
+WORKDIR /app
+COPY package.json bun.lockb ./
+RUN bun install --frozen-lockfile
+COPY . .
+RUN bun run build
+
+FROM nginx:alpine
+COPY --from=build /app/dist /usr/share/nginx/html
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+EXPOSE 80
+```
+
+`nginx.conf` in `desktop/`:
+
+```nginx
+server {
+    listen 80;
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # SPA fallback
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # Proxy API and WebSocket to Gateway
+    location /api/ {
+        proxy_pass http://gateway:3456;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+
+    location /ws/ {
+        proxy_pass http://gateway:3456;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+    }
+
+    location /health {
+        proxy_pass http://gateway:3456;
+    }
+}
+```
+
+### E2E Test Scenarios
+
+All scenarios run via `scripts/e2e-test.sh` and can also be executed manually with curl.
+
+---
+
+#### Scenario 1: User Registration & Login
+
+```bash
+# Register tenant A
+curl -s -X POST http://127.0.0.1:3456/api/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@acme.com","password":"test1234","tenantName":"Acme Corp","tenantSlug":"acme"}' \
+  | jq .
+
+# Expected:
+# { "accessToken": "eyJ...", "refreshToken": "eyJ...", "tenantId": "uuid-acme", "userId": "uuid-alice" }
+
+# Save tokens
+TOKEN_A=$(curl -s -X POST http://127.0.0.1:3456/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@acme.com","password":"test1234"}' | jq -r '.accessToken')
+
+# Register tenant B
+curl -s -X POST http://127.0.0.1:3456/api/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"email":"bob@beta.com","password":"test1234","tenantName":"Beta Inc","tenantSlug":"beta"}'
+
+TOKEN_B=$(curl -s -X POST http://127.0.0.1:3456/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"bob@beta.com","password":"test1234"}' | jq -r '.accessToken')
+
+# Verify token contains tenant info
+echo "$TOKEN_A" | cut -d. -f2 | base64 -d 2>/dev/null | jq .
+# Expected: { "sub": "...", "tid": "uuid-acme", "role": "owner", ... }
+```
+
+**Pass criteria:**
+- Registration returns 200 with valid JWT
+- Login returns 200 with valid JWT
+- JWT payload contains `tid` (tenantId) matching the created tenant
+- Duplicate email registration returns 409
+
+---
+
+#### Scenario 2: Provider Configuration (BYOK)
+
+```bash
+# Tenant A configures BYOK provider
+curl -s -X POST http://127.0.0.1:3456/api/providers \
+  -H "Authorization: Bearer $TOKEN_A" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "my-anthropic",
+    "type": "anthropic",
+    "baseUrl": "https://api.anthropic.com",
+    "authToken": "sk-ant-ak-test-key-xxx",
+    "models": ["claude-sonnet-4-6"]
+  }' | jq .
+
+# Expected: { "id": "uuid-provider", "name": "my-anthropic", "isActive": true }
+
+# Verify: auth token is NOT returned in GET response
+curl -s http://127.0.0.1:3456/api/providers \
+  -H "Authorization: Bearer $TOKEN_A" | jq .
+# Expected: authToken should be masked or absent
+
+# Verify: Tenant B cannot see Tenant A's providers
+curl -s http://127.0.0.1:3456/api/providers \
+  -H "Authorization: Bearer $TOKEN_B" | jq .
+# Expected: []
+```
+
+**Pass criteria:**
+- Provider created successfully
+- Auth token not exposed in GET response
+- Tenant B sees zero providers (cross-tenant isolation)
+
+---
+
+#### Scenario 3: Session Creation & Agent Execution
+
+```bash
+# Create session for tenant A
+SESSION_RESP=$(curl -s -X POST http://127.0.0.1:3456/api/sessions \
+  -H "Authorization: Bearer $TOKEN_A" \
+  -H "Content-Type: application/json" \
+  -d '{"workDir": "/workspace", "model": "claude-sonnet-4-6"}')
+SESSION_ID=$(echo "$SESSION_RESP" | jq -r '.sessionId')
+echo "Session: $SESSION_ID"
+
+# Connect WebSocket and send message (using websocat or wscat)
+# Install: brew install websocat
+echo '{"type":"user_message","content":"帮我生成一份SQL"}' | \
+  timeout 60 websocat -1 "ws://127.0.0.1:3456/ws/$SESSION_ID?token=$TOKEN_A"
+
+# Alternatively, use the helper script:
+./scripts/e2e-chat.sh "$TOKEN_A" "$SESSION_ID" "帮我生成一份SQL"
+```
+
+**Pass criteria:**
+- Session created with status `idle`
+- Container started (visible via `docker ps`)
+- WebSocket receives `connected` message
+- WebSocket receives `status: thinking` → `status: streaming` flow
+- WebSocket receives `content_delta` with response text
+- After completion, `message_complete` with usage stats
+
+---
+
+#### Scenario 4: Permission Flow
+
+```bash
+# Send a message that triggers a tool use (e.g., asking to write a file)
+./scripts/e2e-chat.sh "$TOKEN_A" "$SESSION_ID" "请创建一个文件 hello.txt 内容为 Hello World"
+
+# Expected event sequence on WebSocket:
+# 1. { type: "content_start", blockType: "text" }
+# 2. { type: "content_delta", text: "I'll create..." }
+# 3. { type: "content_start", blockType: "tool_use", toolName: "Write" }
+# 4. { type: "tool_use_complete", toolName: "Write", ... }
+# 5. { type: "permission_request", requestId: "...", toolName: "Write", ... }
+#
+# Respond with allow:
+echo '{"type":"permission_response","requestId":"<requestId>","allowed":true}' | \
+  websocat "ws://127.0.0.1:3456/ws/$SESSION_ID?token=$TOKEN_A"
+#
+# 6. { type: "tool_result", toolUseId: "...", isError: false }
+# 7. { type: "content_delta", text: "I've created..." }
+# 8. { type: "message_complete", usage: { ... } }
+```
+
+**Pass criteria:**
+- Permission request received on client WS
+- After allow response, tool executes successfully
+- Tool result is sent back
+- File exists in tenant workspace volume
+
+---
+
+#### Scenario 5: Tenant Data Isolation
+
+```bash
+# List sessions as Tenant A
+curl -s http://127.0.0.1:3456/api/sessions \
+  -H "Authorization: Bearer $TOKEN_A" | jq '. | length'
+# Expected: 1 (the session created above)
+
+# List sessions as Tenant B
+curl -s http://127.0.0.1:3456/api/sessions \
+  -H "Authorization: Bearer $TOKEN_B" | jq '. | length'
+# Expected: 0
+
+# Try to access Tenant A's session as Tenant B
+curl -s http://127.0.0.1:3456/api/sessions/$SESSION_ID \
+  -H "Authorization: Bearer $TOKEN_B"
+# Expected: 404 { "error": "SESSION_NOT_FOUND" }
+
+# Verify database isolation directly
+docker exec cc-haha-postgres psql -U cc_haha -c \
+  "SELECT tenant_id, count(*) FROM sessions GROUP BY tenant_id;"
+# Expected: two rows with correct counts per tenant
+```
+
+**Pass criteria:**
+- Each tenant sees only their own sessions
+- Cross-tenant session access returns 404
+- Database query shows tenant-scoped data
+
+---
+
+#### Scenario 6: Container Lifecycle
+
+```bash
+# Verify container is running during active session
+docker ps --filter "label=cc-haha.session-id=$SESSION_ID"
+# Expected: 1 container running
+
+# Stop the session via API
+curl -s -X DELETE "http://127.0.0.1:3456/api/sessions/$SESSION_ID" \
+  -H "Authorization: Bearer $TOKEN_A"
+
+# Verify container is cleaned up (wait 5s for graceful shutdown)
+sleep 5
+docker ps --filter "label=cc-haha.session-id=$SESSION_ID"
+# Expected: 0 containers
+
+# Verify Orchestrator health
+curl -s http://127.0.0.1:3457/internal/health | jq .
+# Expected: { "status": "ok", "dockerDaemon": "connected", "runningContainers": 0 }
+```
+
+**Pass criteria:**
+- Container created when session starts
+- Container removed when session stops
+- No orphan containers after cleanup
+
+---
+
+#### Scenario 7: Auth Token Refresh & Expiry
+
+```bash
+# Get fresh tokens
+LOGIN_RESP=$(curl -s -X POST http://127.0.0.1:3456/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@acme.com","password":"test1234"}')
+ACCESS_TOKEN=$(echo "$LOGIN_RESP" | jq -r '.accessToken')
+REFRESH_TOKEN=$(echo "$LOGIN_RESP" | jq -r '.refreshToken')
+
+# Wait for access token to expire (15 min in production; set to 30s in e2e via JWT_ACCESS_TTL=30s)
+sleep 35
+
+# Access token should be rejected
+curl -s http://127.0.0.1:3456/api/sessions \
+  -H "Authorization: Bearer $ACCESS_TOKEN" | jq .
+# Expected: 401 { "error": "UNAUTHORIZED" }
+
+# Refresh the token
+NEW_ACCESS=$(curl -s -X POST http://127.0.0.1:3456/api/auth/refresh \
+  -H "Content-Type: application/json" \
+  -d "{\"refreshToken\":\"$REFRESH_TOKEN\"}" | jq -r '.accessToken')
+
+# New access token should work
+curl -s http://127.0.0.1:3456/api/sessions \
+  -H "Authorization: Bearer $NEW_ACCESS" | jq .
+# Expected: 200 with session list
+```
+
+**Pass criteria:**
+- Expired access token returns 401
+- Refresh token grants new access token
+- New access token works
+
+---
+
+#### Scenario 8: Rate Limiting
+
+```bash
+# Send many requests rapidly as tenant A (free tier: 60 req/min)
+for i in $(seq 1 70); do
+  STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3456/api/sessions \
+    -H "Authorization: Bearer $TOKEN_A")
+  echo "Request $i: $STATUS"
+done
+
+# Expected: first 60 return 200, subsequent return 429
+```
+
+**Pass criteria:**
+- Requests within limit return 200
+- Requests exceeding limit return 429 with `TENANT_QUOTA_EXCEEDED`
+
+---
+
+#### Scenario 9: Conversation Persistence & Resume
+
+```bash
+# Create session and have a conversation
+SESSION_ID=$(curl -s -X POST http://127.0.0.1:3456/api/sessions \
+  -H "Authorization: Bearer $TOKEN_A" \
+  -H "Content-Type: application/json" \
+  -d '{"workDir":"/workspace"}' | jq -r '.sessionId')
+
+# Send first message
+./scripts/e2e-chat.sh "$TOKEN_A" "$SESSION_ID" "hello"
+
+# Verify messages persisted in DB
+docker exec cc-haha-postgres psql -U cc_haha -c \
+  "SELECT role, content FROM conversation_messages WHERE session_id = '$SESSION_ID' ORDER BY created_at;"
+# Expected: rows for user + assistant messages
+
+# Resume session (create new container for same session)
+./scripts/e2e-chat.sh "$TOKEN_A" "$SESSION_ID" "what did I just say?"
+# Expected: agent has context from previous message
+```
+
+**Pass criteria:**
+- Messages persisted in `conversation_messages` table
+- Session resume works — agent has prior conversation context
+
+---
+
+#### Scenario 10: Web UI Full Flow
+
+```
+1. Open http://127.0.0.1:2024 in browser
+2. Click "Register" → fill email, password, tenant name → submit
+3. Auto-redirect to chat interface
+4. Type "帮我生成一份SQL" → enter
+5. Observe streaming response in chat UI
+6. If permission prompt appears → click "Allow"
+7. Verify tool result rendered in UI
+8. Click "New Session" → verify new session starts
+9. Click "Settings" → verify provider management works
+10. Logout → login → verify sessions persist
+```
+
+**Pass criteria:**
+- Complete auth flow works in browser
+- Chat with streaming works
+- Permission prompts render and can be responded to
+- Session list shows history
+- Settings page reads/writes provider config
+
+---
+
+### E2E Test Runner Script
+
+`scripts/e2e-test.sh`:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+BASE_URL="http://127.0.0.1:3456"
+PASS=0
+FAIL=0
+
+report() {
+  local name=$1 result=$2
+  if [ "$result" = "pass" ]; then
+    echo "  ✅ $name"
+    PASS=$((PASS + 1))
+  else
+    echo "  ❌ $name"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+echo "=== E2E Test Suite ==="
+echo ""
+
+# --- Scenario 1: Auth ---
+echo "--- Scenario 1: Auth ---"
+
+# Register tenant A
+RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/api/auth/register" \
+  -H "Content-Type: application/json" \
+  -d '{"email":"e2e-a@test.com","password":"test1234","tenantName":"E2E Alpha","tenantSlug":"e2e-alpha"}')
+STATUS=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+TOKEN_A=$(echo "$BODY" | jq -r '.accessToken')
+TENANT_A=$(echo "$BODY" | jq -r '.tenantId')
+report "Register tenant A" "$([ "$STATUS" = "200" ] && echo pass || echo fail)"
+
+# Register tenant B
+RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/api/auth/register" \
+  -H "Content-Type: application/json" \
+  -d '{"email":"e2e-b@test.com","password":"test1234","tenantName":"E2E Beta","tenantSlug":"e2e-beta"}')
+STATUS=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+TOKEN_B=$(echo "$BODY" | jq -r '.accessToken')
+report "Register tenant B" "$([ "$STATUS" = "200" ] && echo pass || echo fail)"
+
+# Duplicate registration should fail
+RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/api/auth/register" \
+  -H "Content-Type: application/json" \
+  -d '{"email":"e2e-a@test.com","password":"test1234","tenantName":"Dup","tenantSlug":"dup"}')
+STATUS=$(echo "$RESP" | tail -1)
+report "Duplicate registration rejected" "$([ "$STATUS" = "409" ] && echo pass || echo fail)"
+
+# Login
+RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/api/auth/login" \
+  -H "Content-Type: application/json" \
+  -d '{"email":"e2e-a@test.com","password":"test1234"}')
+STATUS=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+TOKEN_A=$(echo "$BODY" | jq -r '.accessToken')
+report "Login success" "$([ "$STATUS" = "200" ] && echo pass || echo fail)"
+
+# --- Scenario 2: Provider ---
+echo "--- Scenario 2: Provider ---"
+
+RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/api/providers" \
+  -H "Authorization: Bearer $TOKEN_A" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"test-provider","type":"anthropic","baseUrl":"https://api.anthropic.com","authToken":"sk-ant-test-key","models":["claude-sonnet-4-6"]}')
+STATUS=$(echo "$RESP" | tail -1)
+report "Create provider" "$([ "$STATUS" = "200" ] && echo pass || echo fail)"
+
+# Verify token not exposed
+BODY=$(curl -s "$BASE_URL/api/providers" -H "Authorization: Bearer $TOKEN_A")
+HAS_KEY=$(echo "$BODY" | jq -r '.[].authToken // empty')
+report "Auth token masked in GET" "$([ -z "$HAS_KEY" ] && echo pass || echo fail)"
+
+# Cross-tenant isolation
+BODY=$(curl -s "$BASE_URL/api/providers" -H "Authorization: Bearer $TOKEN_B")
+COUNT=$(echo "$BODY" | jq '. | length')
+report "Cross-tenant provider isolation" "$([ "$COUNT" = "0" ] && echo pass || echo fail)"
+
+# --- Scenario 3: Session ---
+echo "--- Scenario 3: Session Creation ---"
+
+RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/api/sessions" \
+  -H "Authorization: Bearer $TOKEN_A" \
+  -H "Content-Type: application/json" \
+  -d '{"workDir":"/workspace"}')
+STATUS=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+SESSION_ID=$(echo "$BODY" | jq -r '.sessionId')
+report "Create session" "$([ "$STATUS" = "200" ] && echo pass || echo fail)"
+
+# --- Scenario 5: Data Isolation ---
+echo "--- Scenario 5: Data Isolation ---"
+
+BODY=$(curl -s "$BASE_URL/api/sessions" -H "Authorization: Bearer $TOKEN_A")
+COUNT=$(echo "$BODY" | jq '. | length')
+report "Tenant A sees own sessions" "$([ "$COUNT" -ge "1" ] && echo pass || echo fail)"
+
+BODY=$(curl -s "$BASE_URL/api/sessions" -H "Authorization: Bearer $TOKEN_B")
+COUNT=$(echo "$BODY" | jq '. | length')
+report "Tenant B sees no sessions" "$([ "$COUNT" = "0" ] && echo pass || echo fail)"
+
+RESP=$(curl -s -w "\n%{http_code}" "$BASE_URL/api/sessions/$SESSION_ID" \
+  -H "Authorization: Bearer $TOKEN_B")
+STATUS=$(echo "$RESP" | tail -1)
+report "Cross-tenant session access denied" "$([ "$STATUS" = "404" ] && echo pass || echo fail)"
+
+# --- Scenario 6: Container Lifecycle ---
+echo "--- Scenario 6: Container Lifecycle ---"
+
+# Delete session
+RESP=$(curl -s -w "\n%{http_code}" -X DELETE "$BASE_URL/api/sessions/$SESSION_ID" \
+  -H "Authorization: Bearer $TOKEN_A")
+STATUS=$(echo "$RESP" | tail -1)
+report "Delete session" "$([ "$STATUS" = "200" ] && echo pass || echo fail)"
+
+# --- Gateway Health ---
+echo "--- Gateway Health ---"
+
+RESP=$(curl -s "$BASE_URL/api/status")
+STATUS=$(echo "$RESP" | jq -r '.status')
+report "Gateway status OK" "$([ "$STATUS" = "ok" ] && echo pass || echo fail)"
+
+# --- Orchestrator Health ---
+echo "--- Orchestrator Health ---"
+
+RESP=$(curl -s "http://127.0.0.1:3457/internal/health")
+STATUS=$(echo "$RESP" | jq -r '.status')
+report "Orchestrator status OK" "$([ "$STATUS" = "ok" ] && echo pass || echo fail)"
+
+# --- Summary ---
+echo ""
+echo "=== Results: $PASS passed, $FAIL failed ==="
+[ "$FAIL" -eq 0 ] && exit 0 || exit 1
+```
+
+### Wait-for-Ready Script
+
+`scripts/e2e-wait-for-ready.sh`:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "Waiting for services to be ready..."
+MAX_WAIT=120
+ELAPSED=0
+
+while [ $ELAPSED -lt $MAX_WAIT ]; do
+  if curl -sf http://127.0.0.1:3456/api/status > /dev/null 2>&1 && \
+     curl -sf http://127.0.0.1:3457/internal/health > /dev/null 2>&1; then
+    echo "All services ready after ${ELAPSED}s"
+    exit 0
+  fi
+  sleep 2
+  ELAPSED=$((ELAPSED + 2))
+  echo "  ... waiting (${ELAPSED}s)"
+done
+
+echo "ERROR: Services not ready after ${MAX_WAIT}s"
+exit 1
+```
+
+### Chat Helper Script
+
+`scripts/e2e-chat.sh`:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+TOKEN=$1
+SESSION_ID=$2
+MESSAGE=$3
+BASE_WS="ws://127.0.0.1:3456/ws/$SESSION_ID?token=$TOKEN"
+
+# Use websocat or fall back to a simple node script
+if command -v websocat &> /dev/null; then
+  # Send message and listen for 60s
+  (echo "{\"type\":\"user_message\",\"content\":\"$MESSAGE\"}"; sleep 60) | \
+    timeout 65 websocat "$BASE_WS" 2>/dev/null || true
+elif command -v node &> /dev/null; then
+  node -e "
+    const WebSocket = require('ws');
+    const ws = new WebSocket('$BASE_WS');
+    ws.on('open', () => {
+      ws.send(JSON.stringify({type:'user_message',content:'$MESSAGE'}));
+      setTimeout(() => { ws.close(); process.exit(0); }, 60000);
+    });
+    ws.on('message', (data) => { console.log(data.toString()); });
+    ws.on('error', (e) => { console.error(e.message); process.exit(1); });
+  "
+else
+  echo "Error: install websocat (brew install websocat) or node"
+  exit 1
+fi
+```
+
+---
+
+## README — Multi-Tenant SaaS Deployment
+
+This section serves as the README for the multi-tenant mode of cc-haha.
+
+### What Is This?
+
+cc-haha can run in two modes:
+
+- **`local`** (default): Single-user CLI/desktop mode, identical to the current experience. No Docker, no PostgreSQL required.
+- **`saas`**: Multi-tenant cloud service mode. Multiple organizations share the same deployment, with logical data isolation, Docker-containerized agent sessions, and JWT-based authentication.
+
+Mode is controlled by the `CC_MODE` environment variable.
+
+### Architecture
+
+```
+User Browser / IM Client
+       │
+       ▼
+   Gateway (Bun)        ← JWT auth, rate limiting, API routing, WebSocket proxy
+       │
+       ├──► PostgreSQL  ← Tenant-scoped data storage
+       │
+       └──► Orchestrator (Bun)  ← Docker container lifecycle
+                │
+                └──► Agent Container (per session)
+                     └──► LLM Provider API
+```
+
+### Quick Start (Local Docker)
+
+```bash
+# Prerequisites: Docker 24+, Docker Compose v2+, Bun 1.1+
+
+# 1. Clone and enter project
+cd cc-haha
+
+# 2. Build and start all services
+docker compose -f docker-compose.e2e.yml up --build -d
+
+# 3. Wait for readiness
+./scripts/e2e-wait-for-ready.sh
+
+# 4. Run E2E tests
+./scripts/e2e-test.sh
+
+# 5. Open web UI
+open http://127.0.0.1:2024
+
+# 6. Teardown
+docker compose -f docker-compose.e2e.yml down -v
+```
+
+### Environment Variables
+
+| Variable | Required | Description | Default |
+|----------|----------|-------------|---------|
+| `CC_MODE` | Yes | `local` or `saas` | `local` |
+| `DATABASE_URL` | saas | PostgreSQL connection string | — |
+| `JWT_PRIVATE_KEY_PATH` | saas | Path to RS256 private key | — |
+| `JWT_PUBLIC_KEY_PATH` | saas | Path to RS256 public key | — |
+| `ENCRYPTION_KEY_PATH` | saas | Path to AES-256 encryption key | — |
+| `JWT_ACCESS_TTL` | saas | Access token lifetime | `15m` |
+| `JWT_REFRESH_TTL` | saas | Refresh token lifetime | `7d` |
+| `ORCHESTRATOR_URL` | saas | Internal URL for Orchestrator | `http://127.0.0.1:3457` |
+| `DOCKER_HOST` | saas | Docker daemon socket | `unix:///var/run/docker.sock` |
+| `AGENT_IMAGE` | saas | Agent container image name | `cc-haha-agent:latest` |
+| `GATEWAY_SDK_URL` | saas | URL containers use for SDK WS | `ws://127.0.0.1:3456` |
+| `SERVER_PORT` | both | Gateway HTTP port | `3456` |
+| `SERVER_HOST` | both | Gateway bind address | `127.0.0.1` |
+
+### API Reference
+
+#### Authentication
+
+```
+POST /api/auth/register     Register new tenant + user
+POST /api/auth/login        Login with email/password
+POST /api/auth/refresh      Refresh access token
+POST /api/auth/social       Social OAuth (Google/GitHub)
+```
+
+#### Sessions
+
+```
+GET    /api/sessions                List sessions for current tenant/user
+POST   /api/sessions                Create new session
+GET    /api/sessions/:id            Get session details
+PATCH  /api/sessions/:id            Update session (title, etc.)
+DELETE /api/sessions/:id            Stop and delete session
+GET    /api/sessions/:id/messages   Get conversation messages
+WS     /ws/:sessionId               Real-time chat WebSocket
+```
+
+#### Providers
+
+```
+GET    /api/providers               List providers for current tenant
+POST   /api/providers               Add provider config (BYOK)
+PUT    /api/providers/:id           Update provider
+DELETE /api/providers/:id           Delete provider
+```
+
+#### Settings
+
+```
+GET    /api/settings                Get tenant settings
+PATCH  /api/settings                Update tenant settings
+```
+
+#### System
+
+```
+GET    /api/status                  Health check (public)
+GET    /health                      Simple health check
+```
+
+### WebSocket Protocol
+
+Connect: `wss://<host>/ws/<sessionId>?token=<jwt>`
+
+Client → Server messages:
+
+```json
+{ "type": "user_message", "content": "text" }
+{ "type": "permission_response", "requestId": "...", "allowed": true }
+{ "type": "set_permission_mode", "mode": "default" }
+{ "type": "stop_generation" }
+{ "type": "ping" }
+```
+
+Server → Client messages:
+
+```json
+{ "type": "connected", "sessionId": "..." }
+{ "type": "content_start", "blockType": "text|tool_use", "toolName": "..." }
+{ "type": "content_delta", "text": "..." }
+{ "type": "tool_use_complete", "toolName": "...", "toolUseId": "...", "input": {} }
+{ "type": "tool_result", "toolUseId": "...", "content": {}, "isError": false }
+{ "type": "permission_request", "requestId": "...", "toolName": "...", "input": {} }
+{ "type": "message_complete", "usage": { "input_tokens": 0, "output_tokens": 0 } }
+{ "type": "status", "state": "idle|thinking|streaming|permission_pending", "verb": "..." }
+{ "type": "error", "message": "...", "code": "..." }
+{ "type": "session_title_updated", "sessionId": "...", "title": "..." }
+{ "type": "pong" }
+```
+
+### Development
+
+```bash
+# Run in saas mode locally (without Docker containers for Gateway/Orchestrator)
+CC_MODE=saas \
+DATABASE_URL=postgres://cc_haha:password@127.0.0.1:5432/cc_haha \
+JWT_PRIVATE_KEY_PATH=./keys/private.pem \
+JWT_PUBLIC_KEY_PATH=./keys/public.pem \
+ENCRYPTION_KEY_PATH=./keys/encryption.key \
+bun run src/gateway/index.ts
+
+# Run Orchestrator locally
+ORCHESTRATOR_URL=http://127.0.0.1:3457 \
+DOCKER_HOST=unix:///var/run/docker.sock \
+AGENT_IMAGE=cc-haha-agent:latest \
+GATEWAY_SDK_URL=ws://127.0.0.1:3456 \
+bun run src/orchestrator/index.ts
+
+# Run database migrations
+DATABASE_URL=postgres://cc_haha:password@127.0.0.1:5432/cc_haha \
+bun run src/db/migrate.ts
+
+# Run tests (saas mode)
+DATABASE_URL=postgres://cc_haha:password@127.0.0.1:5432/cc_haha_test \
+CC_MODE=saas \
+bun test src/server/__tests__/
+```
+
+### Troubleshooting
+
+| Symptom | Check | Fix |
+|---------|-------|-----|
+| Gateway won't start | `docker compose logs gateway` | Verify DATABASE_URL and key paths |
+| Orchestrator won't start | `docker compose logs orchestrator` | Verify Docker socket mount |
+| Container creation fails | `docker compose logs orchestrator` | Check agent image exists: `docker images cc-haha-agent` |
+| WebSocket disconnects | Browser console / `docker compose logs gateway` | Verify JWT not expired; check session still active |
+| Permission prompts not received | WebSocket messages in browser DevTools | Verify permission mode not set to `bypass` |
+| Cross-tenant data leak | DB query directly | Verify RLS policies: `SELECT * FROM pg_policies` |
+| Port conflicts | `lsof -i :3456 -i :3457 -i :5432` | Stop conflicting services or change ports in compose file |
