@@ -298,11 +298,16 @@ Orchestrator receives: `{ sessionId, tenantId, userId, workDir, providerConfig, 
      - `CALLER_DIR` = /workspace
      - `PWD` = /workspace
      - `HOME` = /home/agent
+     - `CLAUDE_CONFIG_DIR` = /home/agent/.claude/users/{userId}
      - `CC_HAHA_SKIP_DOTENV` = 1
      - `CLAUDE_CODE_ENABLE_TASKS` = 1
    - **Volume mounts**:
      - tenant workspace volume → /workspace
-     - tenant home volume → /home/agent/.claude
+     - tenant home volume → /home/agent/.claude (tenant-level shared)
+     - user home volume → /home/agent/.claude/users/{userId} (user-level isolated)
+   - **Symlinks** (created by Orchestrator before container start):
+     - /home/agent/.claude/users/{userId}/CLAUDE.md → /home/agent/.claude/CLAUDE.md (tenant-level)
+     - /home/agent/.claude/users/{userId}/rules/tenant-rules → /home/agent/.claude/rules/ (tenant-level)
    - **Network**: internal Docker network (can reach Gateway SDK endpoint + LLM provider APIs; cannot reach other containers or host)
    - **CLI args**: `--print --verbose --sdk-url ws://gateway:3456/sdk/{sessionId}?token={sdkToken} --session-id {sessionId} --input-format stream-json --output-format stream-json`
    - **Resource limits**: CPU shares, memory cap (per plan tier), no --privileged
@@ -315,47 +320,114 @@ Orchestrator receives: `{ sessionId, tenantId, userId, workDir, providerConfig, 
 
 ### Volume Mounts & Memory Persistence
 
-Each tenant gets **two** Docker named volumes per container:
+Each container gets **three** Docker named volumes, implementing a three-layer memory hierarchy with tenant-level sharing and user-level isolation:
 
 **1. Workspace volume**: `tenant-{tenantId}-workspace`
 - Mounted at `/workspace` in every container for that tenant
-- Contains project files, project-level `CLAUDE.md`, `.claude/memory/`
-- Persistent across sessions — user can resume conversations and see their files
+- Contains project files, project-level `CLAUDE.md`, `.claude/rules/`
+- Persistent across sessions — all users in the tenant share the same project files
 - Enterprise option: mount external storage (S3, NFS) instead
 
-**2. Home volume**: `tenant-{tenantId}-home`
+**2. Tenant home volume**: `tenant-{tenantId}-home`
 - Mounted at `/home/agent/.claude` in every container for that tenant
-- Contains global user memory that persists across sessions:
-  - `~/.claude/CLAUDE.md` — global user instructions
-  - `~/.claude/memory/` — cross-session memory/preference files
-- Container env: `HOME=/home/agent`
-- This ensures that every time a container starts for the tenant, the CLI's `~/.claude/` reads from the persistent home volume
+- Contains **tenant-level** shared memory:
+  - `CLAUDE.md` — tenant-wide global instructions (all users inherit)
+  - `rules/` — tenant-wide rules (e.g. coding standards for the org)
+  - `settings.json` — tenant-level defaults
+- All users within the tenant share this volume (read+write)
+- Write protection: tenant-level `CLAUDE.md` and `rules/` are managed via Gateway API (`PATCH /api/settings/tenant-claude-md`), not by agents directly writing to the file. This prevents concurrent-write conflicts.
+
+**3. User home volume**: `tenant-{tenantId}-user-{userId}`
+- Mounted at `/home/agent/.claude/users/{userId}` in containers for that specific user
+- Contains **user-level** isolated memory:
+  - `CLAUDE.md` — private global instructions for this user only
+  - `rules/` — private user rules
+  - `projects/{sanitized-path}/memory/MEMORY.md` — AutoMem (user+project scoped)
+  - `projects/{sanitized-path}/{sessionId}.jsonl` — resume transcript cache
+  - `cache/` — user-specific cache
+- Each user has their own volume; no user can access another user's volume
+- This ensures cross-user isolation within the same tenant
+
+**Symlink bridge**: The CLI resolves `~/.claude/` via `CLAUDE_CONFIG_DIR` env var (see `src/utils/envUtils.ts:7-14`). The Orchestrator sets:
+
+```
+CLAUDE_CONFIG_DIR=/home/agent/.claude/users/{userId}
+```
+
+And creates symlinks inside the user directory pointing to tenant-level shared files:
+
+```
+/home/agent/.claude/users/{userId}/CLAUDE.md
+  → /home/agent/.claude/CLAUDE.md         (tenant-level, read-only for agents)
+
+/home/agent/.claude/users/{userId}/rules/tenant-rules/
+  → /home/agent/.claude/rules/             (tenant-level rules)
+```
+
+The CLI's `getMemoryPath()` function loads files in priority order (the later-loaded files have higher priority):
+
+| Priority | MemoryType | Resolved path in container | Source volume | Scope |
+|----------|-----------|---------------------------|---------------|-------|
+| 1 (low) | Managed | `/etc/claude-code/CLAUDE.md` | Container image | Platform |
+| 2 | Tenant | `~/.claude/CLAUDE.md` → symlink → tenant-home | `tenant-{id}-home` | Tenant-wide |
+| 3 | User | `~/.claude/users/{userId}/CLAUDE.md` (if exists, overrides symlink) | `tenant-{id}-user-{userId}` | User-private |
+| 4 | Project | `/workspace/CLAUDE.md` | `tenant-{id}-workspace` | Tenant-wide |
+| 5 | Local | `/workspace/CLAUDE.local.md` | `tenant-{id}-workspace` | User-private |
+| 6 | AutoMem | `~/.claude/users/{userId}/projects/{path}/memory/MEMORY.md` | `tenant-{id}-user-{userId}` | User-private |
+| 7 (high) | Tenant Rules | `~/.claude/rules/*.md` → symlinks | `tenant-{id}-home` | Tenant-wide |
+
+**Cross-tenant isolation**: Guaranteed at the Docker volume level. Tenant A's containers only mount `tenant-A-*` volumes; Tenant B's containers only mount `tenant-B-*` volumes. No symlink can cross tenant boundaries because the Orchestrator only creates symlinks within the same tenant's volumes.
+
+**Concurrent write safety**: Tenant-level `CLAUDE.md` and `rules/` are managed exclusively through Gateway API endpoints. Agent containers read these files but do not write to them directly. User-level directories are per-user volumes, so no concurrent write conflicts exist.
 
 **Resume mechanism**: When a user resumes an existing session:
 1. Orchestrator queries `conversation_messages` from PostgreSQL for the session
 2. Converts to JSONL format matching the CLI's transcript schema
-3. Writes the transcript into the home volume at `/home/agent/.claude/projects/{sanitized_path}/{sessionId}.jsonl`
+3. Writes the transcript into the **user home volume** at `/home/agent/.claude/users/{userId}/projects/{sanitized_path}/{sessionId}.jsonl`
 4. Starts the container with `--resume {sessionId}`
 5. CLI reads the transcript file and reconstructs conversation context
 
-This means: **transcripts are authored by PostgreSQL → exported to volume → read by CLI**. PostgreSQL is the source of truth; the JSONL file in the home volume is a cache for the CLI to consume.
+PostgreSQL is the source of truth; the JSONL file in the user home volume is a cache for the CLI to consume.
 
 ```
-┌─ tenant-acme-workspace volume ──────────────┐
-│  /workspace/                                 │
-│  ├── CLAUDE.md          ← project-level ✅   │
-│  ├── .claude/memory/    ← project-level ✅   │
-│  └── (project files)                         │
-└──────────────────────────────────────────────┘
+┌─ tenant-acme-workspace volume ──────────────────────────┐
+│  /workspace/                                             │
+│  ├── CLAUDE.md          ← project-level, tenant-shared   │
+│  ├── .claude/rules/     ← project-level rules            │
+│  └── (project files)                                     │
+└──────────────────────────────────────────────────────────┘
 
-┌─ tenant-acme-home volume ───────────────────┐
-│  /home/agent/.claude/                        │
-│  ├── CLAUDE.md          ← global user ✅     │
-│  ├── memory/            ← global memory ✅   │
-│  │   └── preferences.md                      │
-│  └── projects/{path}/                        │
-│      └── {sessionId}.jsonl ← resume cache ✅ │
-└──────────────────────────────────────────────┘
+┌─ tenant-acme-home volume ───────────────────────────────┐
+│  /home/agent/.claude/                                    │
+│  ├── CLAUDE.md          ← tenant-level, all users share  │
+│  ├── rules/             ← tenant-level rules             │
+│  │   └── coding-standards.md                             │
+│  └── settings.json      ← tenant-level defaults          │
+└──────────────────────────────────────────────────────────┘
+
+┌─ tenant-acme-user-alice volume ─────────────────────────┐
+│  /home/agent/.claude/users/alice/                        │
+│  ├── CLAUDE.md          ← alice's private user-level     │
+│  ├── rules/             ← alice's private rules          │
+│  ├── cache/             ← alice's cache                  │
+│  ├── projects/{path}/                                    │
+│  │   ├── memory/                                         │
+│  │   │   └── MEMORY.md  ← alice's AutoMem for project    │
+│  │   └── {sid}.jsonl    ← resume transcript cache        │
+│  └── [symlinks to tenant-home]  ← tenant-level sharing   │
+└──────────────────────────────────────────────────────────┘
+
+┌─ tenant-acme-user-bob volume ───────────────────────────┐
+│  /home/agent/.claude/users/bob/                          │
+│  ├── CLAUDE.md          ← bob's private user-level       │
+│  ├── rules/             ← bob's private rules            │
+│  ├── cache/             ← bob's cache                    │
+│  ├── projects/{path}/                                    │
+│  │   ├── memory/                                         │
+│  │   │   └── MEMORY.md  ← bob's AutoMem for project      │
+│  │   └── {sid}.jsonl    ← resume transcript cache        │
+│  └── [symlinks to tenant-home]  ← tenant-level sharing   │
+└──────────────────────────────────────────────────────────┘
 ```
 
 ### Container Lifecycle
@@ -394,8 +466,9 @@ Events:
 | Container process | Yes | `docker stop` + `--rm` |
 | Container network | Yes | Auto-cleaned with container |
 | Container filesystem | Yes | Auto-cleaned with container (read-only rootfs) |
-| `/workspace` data | No | Docker named volume — persists |
-| `/home/agent/.claude` data | No | Docker named volume — persists (memory, CLAUDE.md) |
+| `/workspace` data | No | Docker named volume — persists (tenant-shared) |
+| `/home/agent/.claude` data | No | Docker named volume — persists (tenant-level memory) |
+| `/home/agent/.claude/users/{userId}` data | No | Docker named volume — persists (user-level memory) |
 | Session DB records | No | PostgreSQL data untouched |
 | Memory/CPU | Yes | Returned to Docker host |
 
@@ -924,6 +997,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - agent-workspaces:/workspaces
       - agent-homes:/homes
+      - agent-user-homes:/user-homes
     depends_on:
       postgres:
         condition: service_healthy
@@ -941,6 +1015,7 @@ volumes:
   pgdata:
   agent-workspaces:
   agent-homes:
+  agent-user-homes:
   web-spa:
 ```
 
