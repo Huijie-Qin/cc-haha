@@ -17,6 +17,7 @@ import { handleAdaptersApi } from './api/adapters.js'
 import { handleSkillsApi } from './api/skills.js'
 import { handleComputerUseApi } from './api/computer-use.js'
 import { handleHahaOAuthApi } from './api/haha-oauth.js'
+import { handleAuthApi } from './api/auth.js'
 
 export async function handleApiRequest(req: Request, url: URL): Promise<Response> {
   const path = url.pathname
@@ -69,6 +70,9 @@ export async function handleApiRequest(req: Request, url: URL): Promise<Response
 
     case 'haha-oauth':
       return handleHahaOAuthApi(req, url, segments)
+
+    case 'auth':
+      return handleAuthApi(req, url, segments)
 
     case 'adapters':
       return handleAdaptersApi(req, url, segments)

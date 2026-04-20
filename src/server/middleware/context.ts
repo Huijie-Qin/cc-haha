@@ -1,3 +1,5 @@
+import { verifyToken } from '../services/authService.js'
+
 export type RequestContext = {
   tenantId: string
   userId: string
@@ -14,20 +16,27 @@ export function isSaasMode(): boolean {
   return process.env.CC_MODE === 'saas'
 }
 
-export function extractRequestContext(req: Request): RequestContext | null {
+export async function extractRequestContext(req: Request): Promise<RequestContext | null> {
   if (!isSaasMode()) {
     return LOCAL_CONTEXT
   }
 
-  // In saas mode, extract from JWT — will be implemented in Phase 2
-  // For now, return null to indicate auth is required but not yet implemented
   const authHeader = req.headers.get('Authorization')
   if (!authHeader?.startsWith('Bearer ')) {
     return null
   }
 
-  // Phase 2 will replace this with JWT verification
-  return null
+  const token = authHeader.slice(7)
+  const claims = await verifyToken(token)
+  if (!claims || claims.type !== 'access') {
+    return null
+  }
+
+  return {
+    tenantId: claims.tid,
+    userId: claims.sub,
+    role: claims.role as RequestContext['role'],
+  }
 }
 
 export function localContext(): RequestContext {

@@ -10,6 +10,7 @@ import { handleWebSocket, type WebSocketData } from './ws/handler.js'
 import { corsHeaders } from './middleware/cors.js'
 import { requireAuth } from './middleware/auth.js'
 import { isSaasMode } from './middleware/context.js'
+import { initAuthKeys } from './services/authService.js'
 import { teamWatcher } from './services/teamWatcher.js'
 import { cronScheduler } from './services/cronScheduler.js'
 import { handleProxyRequest } from './proxy/handler.js'
@@ -61,6 +62,9 @@ export async function startServer(port = PORT, host = HOST) {
       throw new Error('Database connection test failed')
     }
     console.log('[Server] Database connected')
+    // Initialize JWT auth keys
+    await initAuthKeys()
+    console.log('[Server] Auth keys initialized')
   }
 
   const localConnectHost =
@@ -97,7 +101,7 @@ export async function startServer(port = PORT, host = HOST) {
       if (url.pathname.startsWith('/ws/')) {
         // Enforce authentication when required
         if (authRequired) {
-          const authError = requireAuth(req)
+          const authError = await requireAuth(req)
           if (authError) {
             const headers = new Headers(authError.headers)
             for (const [key, value] of Object.entries(corsHeaders(origin))) {
@@ -154,7 +158,7 @@ export async function startServer(port = PORT, host = HOST) {
       if (url.pathname.startsWith('/api/')) {
         // Enforce authentication when required
         if (authRequired) {
-          const authError = requireAuth(req)
+          const authError = await requireAuth(req)
           if (authError) {
             const headers = new Headers(authError.headers)
             for (const [key, value] of Object.entries(corsHeaders(origin))) {
@@ -187,7 +191,7 @@ export async function startServer(port = PORT, host = HOST) {
       // Proxy — protocol-translating reverse proxy for OpenAI-compatible APIs
       if (url.pathname.startsWith('/proxy/')) {
         if (authRequired) {
-          const authError = requireAuth(req)
+          const authError = await requireAuth(req)
           if (authError) {
             const headers = new Headers(authError.headers)
             for (const [key, value] of Object.entries(corsHeaders(origin))) {

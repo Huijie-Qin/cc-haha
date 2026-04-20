@@ -2,12 +2,12 @@
  * Authentication middleware
  *
  * CC_MODE=local: validates against ANTHROPIC_API_KEY (current behavior)
- * CC_MODE=saas: validates JWT and extracts RequestContext (Phase 2)
+ * CC_MODE=saas: validates JWT and extracts RequestContext
  */
 
 import { isSaasMode, extractRequestContext } from './context.js'
 
-export function validateAuth(req: Request): { valid: boolean; error?: string } {
+export async function validateAuth(req: Request): Promise<{ valid: boolean; error?: string }> {
   const authHeader = req.headers.get('Authorization')
 
   if (!authHeader) {
@@ -20,9 +20,9 @@ export function validateAuth(req: Request): { valid: boolean; error?: string } {
     return { valid: false, error: 'Invalid Authorization format. Use: Bearer <token>' }
   }
 
-  // In saas mode, the token is a JWT — validation happens via extractRequestContext in Phase 2
+  // In saas mode, validate JWT via extractRequestContext
   if (isSaasMode()) {
-    const ctx = extractRequestContext(req)
+    const ctx = await extractRequestContext(req)
     if (!ctx) {
       return { valid: false, error: 'Invalid or expired JWT' }
     }
@@ -45,8 +45,8 @@ export function validateAuth(req: Request): { valid: boolean; error?: string } {
 /**
  * Helper to check auth and return 401 if invalid
  */
-export function requireAuth(req: Request): Response | null {
-  const { valid, error } = validateAuth(req)
+export async function requireAuth(req: Request): Promise<Response | null> {
+  const { valid, error } = await validateAuth(req)
   if (!valid) {
     return Response.json({ error: 'Unauthorized', message: error }, { status: 401 })
   }
