@@ -297,9 +297,12 @@ Orchestrator receives: `{ sessionId, tenantId, userId, workDir, providerConfig, 
      - `ANTHROPIC_MODEL` = runtimeSettings.model
      - `CALLER_DIR` = /workspace
      - `PWD` = /workspace
+     - `HOME` = /home/agent
      - `CC_HAHA_SKIP_DOTENV` = 1
      - `CLAUDE_CODE_ENABLE_TASKS` = 1
-   - **Volume mount**: tenant workspace volume → /workspace
+   - **Volume mounts**:
+     - tenant workspace volume → /workspace
+     - tenant home volume → /home/agent/.claude
    - **Network**: internal Docker network (can reach Gateway SDK endpoint + LLM provider APIs; cannot reach other containers or host)
    - **CLI args**: `--print --verbose --sdk-url ws://gateway:3456/sdk/{sessionId}?token={sdkToken} --session-id {sessionId} --input-format stream-json --output-format stream-json`
    - **Resource limits**: CPU shares, memory cap (per plan tier), no --privileged
@@ -310,12 +313,50 @@ Orchestrator receives: `{ sessionId, tenantId, userId, workDir, providerConfig, 
 
 3. Return container info to Gateway: `{ containerId, status: 'active' }`
 
-### Workspace Volumes
+### Volume Mounts & Memory Persistence
 
-- Each tenant gets a named Docker volume: `tenant-{tenantId}-workspace`
+Each tenant gets **two** Docker named volumes per container:
+
+**1. Workspace volume**: `tenant-{tenantId}-workspace`
 - Mounted at `/workspace` in every container for that tenant
+- Contains project files, project-level `CLAUDE.md`, `.claude/memory/`
 - Persistent across sessions — user can resume conversations and see their files
 - Enterprise option: mount external storage (S3, NFS) instead
+
+**2. Home volume**: `tenant-{tenantId}-home`
+- Mounted at `/home/agent/.claude` in every container for that tenant
+- Contains global user memory that persists across sessions:
+  - `~/.claude/CLAUDE.md` — global user instructions
+  - `~/.claude/memory/` — cross-session memory/preference files
+- Container env: `HOME=/home/agent`
+- This ensures that every time a container starts for the tenant, the CLI's `~/.claude/` reads from the persistent home volume
+
+**Resume mechanism**: When a user resumes an existing session:
+1. Orchestrator queries `conversation_messages` from PostgreSQL for the session
+2. Converts to JSONL format matching the CLI's transcript schema
+3. Writes the transcript into the home volume at `/home/agent/.claude/projects/{sanitized_path}/{sessionId}.jsonl`
+4. Starts the container with `--resume {sessionId}`
+5. CLI reads the transcript file and reconstructs conversation context
+
+This means: **transcripts are authored by PostgreSQL → exported to volume → read by CLI**. PostgreSQL is the source of truth; the JSONL file in the home volume is a cache for the CLI to consume.
+
+```
+┌─ tenant-acme-workspace volume ──────────────┐
+│  /workspace/                                 │
+│  ├── CLAUDE.md          ← project-level ✅   │
+│  ├── .claude/memory/    ← project-level ✅   │
+│  └── (project files)                         │
+└──────────────────────────────────────────────┘
+
+┌─ tenant-acme-home volume ───────────────────┐
+│  /home/agent/.claude/                        │
+│  ├── CLAUDE.md          ← global user ✅     │
+│  ├── memory/            ← global memory ✅   │
+│  │   └── preferences.md                      │
+│  └── projects/{path}/                        │
+│      └── {sessionId}.jsonl ← resume cache ✅ │
+└──────────────────────────────────────────────┘
+```
 
 ### Container Lifecycle
 
@@ -333,6 +374,32 @@ Events:
   - onUserStop:      immediate stop -> destroying -> remove
   - onContainerExit: cleanup container record -> [none]
 ```
+
+**Container scope**: One container per session. Multiple sessions from the same user each get their own container. The concurrency limit (per plan tier) caps how many containers a user can have simultaneously.
+
+**Destruction triggers** (4 cases):
+
+1. **User主动停止**: User clicks stop or calls `DELETE /api/sessions/:id`. Gateway → Orchestrator → `docker stop --time 3` → SIGTERM (3s) → SIGKILL. Container has `--rm` so auto-removed on exit. Session data (messages, title) remains in PostgreSQL; only the compute container is destroyed.
+
+2. **断连闲置超时**: WebSocket disconnect detected → 30s idle timer starts. If user reconnects within 30s → timer cancelled. If timer fires → same stop flow as case 1. Idle timeout is configurable by plan (Free: 30s, Pro: 5min, Enterprise: configurable).
+
+3. **容器崩溃**: Docker daemon notifies Orchestrator of container exit. Orchestrator cleans up: `sessions.container_id = NULL, sessions.status = 'idle'`. Gateway pushes error to client. On next user message, new container created with `--resume sessionId`.
+
+4. **定期清扫 (兜底)**: Every 60s, Orchestrator queries `sessions WHERE status = 'active'`, cross-references with Docker API. Stale entries (DB says active but container gone) are cleaned up. Orphaned containers (running but no active WebSocket for N minutes) are force-stopped.
+
+**Resource cleanup on destruction**:
+
+| Resource | Released? | Notes |
+|----------|-----------|-------|
+| Container process | Yes | `docker stop` + `--rm` |
+| Container network | Yes | Auto-cleaned with container |
+| Container filesystem | Yes | Auto-cleaned with container (read-only rootfs) |
+| `/workspace` data | No | Docker named volume — persists |
+| `/home/agent/.claude` data | No | Docker named volume — persists (memory, CLAUDE.md) |
+| Session DB records | No | PostgreSQL data untouched |
+| Memory/CPU | Yes | Returned to Docker host |
+
+**Concurrent session limit enforcement**: When a tenant hits their plan's max concurrent sessions, new session creation returns `429 TENANT_QUOTA_EXCEEDED`. User must manually close an existing session first.
 
 ### Concurrency Limits (per plan tier)
 
@@ -856,6 +923,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - agent-workspaces:/workspaces
+      - agent-homes:/homes
     depends_on:
       postgres:
         condition: service_healthy
@@ -872,6 +940,7 @@ services:
 volumes:
   pgdata:
   agent-workspaces:
+  agent-homes:
   web-spa:
 ```
 
