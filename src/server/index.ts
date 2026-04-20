@@ -9,6 +9,7 @@ import { handleApiRequest } from './router.js'
 import { handleWebSocket, type WebSocketData } from './ws/handler.js'
 import { corsHeaders } from './middleware/cors.js'
 import { requireAuth } from './middleware/auth.js'
+import { isSaasMode } from './middleware/context.js'
 import { teamWatcher } from './services/teamWatcher.js'
 import { cronScheduler } from './services/cronScheduler.js'
 import { handleProxyRequest } from './proxy/handler.js'
@@ -44,8 +45,24 @@ const SERVER_OPTIONS = resolveServerOptions()
 const PORT = SERVER_OPTIONS.port
 const HOST = SERVER_OPTIONS.host
 
-export function startServer(port = PORT, host = HOST) {
+export async function startServer(port = PORT, host = HOST) {
   ProviderService.setServerPort(port)
+
+  // SaaS mode: initialize PostgreSQL connection and run migrations
+  if (isSaasMode()) {
+    const { getDbClient } = await import('../db/client.js')
+    const { runMigrations } = await import('../db/migrate.js')
+    console.log('[Server] SaaS mode — connecting to PostgreSQL...')
+    const db = getDbClient()
+    await runMigrations()
+    console.log('[Server] Database migrations applied')
+    const result = await db.query('SELECT 1')
+    if (!result.rows.length) {
+      throw new Error('Database connection test failed')
+    }
+    console.log('[Server] Database connected')
+  }
+
   const localConnectHost =
     host === '0.0.0.0' || host === '127.0.0.1' || host === 'localhost'
       ? '127.0.0.1'
